@@ -65,7 +65,7 @@ class DebFileService
             $relativePath = 'tweaks/extracted/' . pathinfo($fileName, PATHINFO_FILENAME);
 
             return [
-                'name' => $controlInfo['Package'] ?? null,
+                'name' => $controlInfo['Name'] ?? $controlInfo['Package'] ?? null,
                 'package' => $controlInfo['Package'] ?? null,
                 'version' => $controlInfo['Version'] ?? null,
                 'author' => $controlInfo['Author'] ?? null,
