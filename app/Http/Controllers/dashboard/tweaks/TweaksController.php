@@ -6,354 +6,236 @@ use App\Models\Tweak;
 use App\Models\Changelog;
 use App\Enums\ActiveEnums;
 use App\Services\DebFileService;
+use App\Services\TweakFileService;
+use App\Services\TweakStatsService;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use App\Http\Controllers\Controller;
-use Illuminate\Support\Facades\Storage;
-use App\Http\Requests\Dashboard\Tweaks\StoreTweakRequest;
-use App\Http\Requests\Dashboard\Tweaks\UpdateTweakRequest;
-use Illuminate\Http\Request;
+use Illuminate\Contracts\View\View;
+use App\Http\Requests\Dashboard\Tweaks\{StoreTweakRequest, UpdateTweakRequest, ChangeLogRequest};
 
 class TweaksController extends Controller
 {
-    protected $debFileService;
-
-    public function __construct(DebFileService $debFileService)
-    {
-        $this->debFileService = $debFileService;
+    public function __construct(
+        private readonly DebFileService $debFileService,
+        private readonly TweakFileService $fileService,
+        private readonly TweakStatsService $statsService
+    ) {
     }
 
-    public function index()
+    public function index(): View
     {
-        $stats = [
-            'total_tweaks' => Tweak::count(),
-            'total_size' => $this->getTotalSize(),
-            'sections' => Tweak::distinct('section')->count('section'),
-            'recent_uploads' => Tweak::where('created_at', '>=', now()->subDays(7))->count(),
-        ];
-
-        $tweaks = Tweak::with('changeLogs')
-            ->latest()
-            ->paginate(15);
-
-        return view('dashboard.tweaks.index', compact('tweaks', 'stats'));
+        return view('dashboard.tweaks.index', [
+            'tweaks' => Tweak::with('changeLogs')->latest()->paginate(15),
+            'stats' => $this->statsService->getStatistics(),
+        ]);
     }
 
-    public function create()
+    public function create(): View
     {
         return view('dashboard.tweaks.create');
     }
 
-    public function store(StoreTweakRequest $request)
+    public function store(StoreTweakRequest $request): RedirectResponse
     {
-        DB::beginTransaction();
-
         try {
-            $file = $request->file('file');
-            $originalName = $file->getClientOriginalName();
-            $fileName = time() . '_' . $originalName;
-            $filePath = $file->storeAs('tweaks/deb_files', $fileName, 'public');
-            $debInfo = $this->debFileService->extractDebFile($file, $fileName);
-            $existingTweak = Tweak::where('package', $debInfo['package'])->first();
-
-            if ($existingTweak) {
-                return $this->handleExistingTweak($existingTweak, $debInfo, $filePath, $request);
-            }
-
-            $tweak = $this->createNewTweak($debInfo, $filePath);
-
-            if ($request->filled('changelog')) {
-                Changelog::create([
-                    'tweak_id' => $tweak->id,
-                    'version' => $tweak->version,
-                    'changelog' => json_encode(preg_split('/\r\n|\r|\n/', $request->changelog)),
-                    'is_active' => ActiveEnums::YES,
-                ]);
-            }
-
-            DB::commit();
-
-            return redirect()
-                ->route('dashboard.tweaks.index')
-                ->with('success', 'Tweak "' . $tweak->name . '" uploaded successfully!');
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            $this->cleanupFile($filePath ?? null);
-            Log::error('Tweak upload failed: ' . $e->getMessage(), [
-                'file' => $originalName ?? 'unknown',
-                'trace' => $e->getTraceAsString()
-            ]);
-
-            return back()
-                ->withInput()
-                ->with('error', 'Failed to process tweak file: ' . $e->getMessage());
-        }
-    }
-
-    public function show(Tweak $tweak)
-    {
-        $tweak->load(['changeLogs' => function ($query) {
-            $query->orderBy('created_at', 'desc');
-        }]);
-
-        return view('dashboard.tweaks.show', compact('tweak'));
-    }
-
-    public function edit(Tweak $tweak)
-    {
-        $tweak->load(['changeLogs' => function ($query) {
-            $query->orderBy('created_at', 'desc');
-        }]);
-
-        return view('dashboard.tweaks.edit', compact('tweak'));
-    }
-
-    public function update(UpdateTweakRequest $request, Tweak $tweak)
-    {
-        DB::beginTransaction();
-
-        try {
-            $oldVersion = $tweak->version;
-            $versionChanged = false;
-
-            // Check if new .deb file is uploaded
-            if ($request->hasFile('file')) {
+            return DB::transaction(function () use ($request) {
                 $file = $request->file('file');
-                $originalName = $file->getClientOriginalName();
-                $fileName = time() . '_' . $originalName;
-                $filePath = $file->storeAs('tweaks/deb_files', $fileName, 'public');
-                $debInfo = $this->debFileService->extractDebFile($file, $fileName);
+                $filePath = $this->fileService->storeDebFile($file);
+                $debInfo = $this->debFileService->extractDebFile($file, basename($filePath));
 
-                // Verify package ID matches
-                if ($debInfo['package'] !== $tweak->package) {
-                    $this->cleanupFile($filePath);
-                    throw new \Exception('Package ID mismatch. Expected: ' . $tweak->package . ', Got: ' . $debInfo['package']);
+                $existingTweak = Tweak::where('package', $debInfo['package'])->first();
+
+                if ($existingTweak) {
+                    return $this->handleExistingTweak($existingTweak, $debInfo, $filePath, $request);
                 }
 
-                // Check version
-                $versionComparison = version_compare($debInfo['version'], $oldVersion);
-                if ($versionComparison < 0) {
-                    $this->cleanupFile($filePath);
-                    throw new \Exception('New version (' . $debInfo['version'] . ') cannot be older than current version (' . $oldVersion . ')');
-                }
+                $tweak = $this->createTweak($debInfo, $filePath);
+                $this->createChangelogIfProvided($tweak, $request);
 
-                if ($versionComparison > 0) {
-                    $versionChanged = true;
-                }
-
-                // Clean up old files
-                $this->cleanupOldTweakFiles($tweak);
-
-                // Update with .deb file data
-                $tweak->update([
-                    'version' => $debInfo['version'],
-                    'description' => $debInfo['description'] ?? $tweak->description,
-                    'author' => $debInfo['author'] ?? $tweak->author,
-                    'maintainer' => $debInfo['maintainer'] ?? $tweak->maintainer,
-                    'section' => $debInfo['section'] ?? $tweak->section,
-                    'architecture' => $debInfo['architecture'] ?? $tweak->architecture,
-                    'depends' => $debInfo['depends'] ?? $tweak->depends,
-                    'homepage' => $debInfo['homepage'] ?? $tweak->homepage,
-                    'icon_url' => $debInfo['control']['Icon'] ?? $tweak->icon_url,
-                    'header_url' => $debInfo['control']['Header'] ?? $tweak->header_url,
-                    'sileo_depiction' => $debInfo['control']['SileoDepiction'] ?? $tweak->sileo_depiction,
-                    'installed_size' => $debInfo['control']['Installed-Size'] ?? $tweak->installed_size,
-                    'deb_file_path' => $filePath,
-                    'extracted_path' => $debInfo['extracted_path'] ?? null,
-                    'icon_path' => $debInfo['icon_path'] ?? null,
-                    'data_files' => json_encode($debInfo['data_files'] ?? []),
-                    'control_data' => json_encode($debInfo['control'] ?? []),
-                ]);
-
-            } else {
-                // Manual update without .deb file
-                $updateData = $request->only([
-                    'name', 'description', 'author', 'maintainer',
-                    'section', 'homepage'
-                ]);
-
-                // Check if version is being manually changed
-                if ($request->filled('version') && $request->version !== $oldVersion) {
-                    $versionComparison = version_compare($request->version, $oldVersion);
-                    if ($versionComparison < 0) {
-                        throw new \Exception('New version cannot be older than current version');
-                    }
-                    if ($versionComparison > 0) {
-                        $versionChanged = true;
-                        $updateData['version'] = $request->version;
-                    }
-                }
-
-                $tweak->update($updateData);
-            }
-
-            // Create changelog if version changed or changelog provided
-            if ($request->filled('changelog') && ($versionChanged || $request->force_changelog)) {
-                Changelog::create([
-                    'tweak_id' => $tweak->id,
-                    'version' => $tweak->version,
-                    'changelog' => json_encode(preg_split('/\r\n|\r|\n/', $request->changelog)),
-                    'is_active' => ActiveEnums::YES,
-                ]);
-            }
-
-            DB::commit();
-
-            $message = $versionChanged
-                ? 'Tweak "' . $tweak->name . '" updated from version ' . $oldVersion . ' to ' . $tweak->version . '!'
-                : 'Tweak "' . $tweak->name . '" updated successfully!';
-
-            return redirect()
-                ->route('dashboard.tweaks.show', $tweak)
-                ->with('success', $message);
-
+                return redirect()
+                    ->route('dashboard.tweaks.index')
+                    ->with('success', "Tweak \"{$tweak->name}\" uploaded successfully!");
+            });
         } catch (\Exception $e) {
-            DB::rollBack();
-            Log::error('Tweak update failed: ' . $e->getMessage());
+            $this->fileService->cleanup($filePath ?? null);
+
+            Log::error('Tweak upload failed', [
+                'file' => $file?->getClientOriginalName() ?? 'unknown',
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
 
             return back()
                 ->withInput()
-                ->with('error', 'Failed to update tweak: ' . $e->getMessage());
+                ->with('error', "Failed to process tweak file: {$e->getMessage()}");
         }
     }
 
-    public function destroy(Tweak $tweak)
+    public function show(Tweak $tweak): View
+    {
+        return view('dashboard.tweaks.show', [
+            'tweak' => $tweak->load(['changeLogs' => fn ($q) => $q->latest()]),
+        ]);
+    }
+
+    public function edit(Tweak $tweak): View
+    {
+        return view('dashboard.tweaks.edit', [
+            'tweak' => $tweak->load(['changeLogs' => fn ($q) => $q->latest()]),
+        ]);
+    }
+
+    public function update(UpdateTweakRequest $request, Tweak $tweak): RedirectResponse
     {
         try {
-            DB::beginTransaction();
-            $this->cleanupOldTweakFiles($tweak);
-            $tweak->changeLogs()->delete();
-            $tweak->delete();
-            DB::commit();
+            return DB::transaction(function () use ($request, $tweak) {
+                $oldVersion = $tweak->version;
+                $versionChanged = false;
+
+                if ($request->hasFile('file')) {
+                    $versionChanged = $this->updateFromDebFile($request, $tweak);
+                } else {
+                    $versionChanged = $this->updateManually($request, $tweak);
+                }
+
+                $this->handleChangelogCreation($request, $tweak, $versionChanged);
+
+                $message = $versionChanged
+                    ? "Tweak \"{$tweak->name}\" updated from version {$oldVersion} to {$tweak->version}!"
+                    : "Tweak \"{$tweak->name}\" updated successfully!";
+
+                return redirect()
+                    ->route('dashboard.tweaks.show', $tweak)
+                    ->with('success', $message);
+            });
+        } catch (\Exception $e) {
+            Log::error('Tweak update failed', [
+                'tweak_id' => $tweak->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            return back()
+                ->withInput()
+                ->with('error', "Failed to update tweak: {$e->getMessage()}");
+        }
+    }
+
+    public function destroy(Tweak $tweak): RedirectResponse
+    {
+        try {
+            DB::transaction(function () use ($tweak) {
+                $this->fileService->cleanupTweakFiles($tweak);
+                $tweak->changeLogs()->delete();
+                $tweak->delete();
+            });
 
             return redirect()
                 ->route('dashboard.tweaks.index')
-                ->with('success', 'Tweak "' . $tweak->name . '" deleted successfully!');
-
+                ->with('success', "Tweak \"{$tweak->name}\" deleted successfully!");
         } catch (\Exception $e) {
-            DB::rollBack();
-            Log::error('Tweak deletion failed: ' . $e->getMessage());
+            Log::error('Tweak deletion failed', [
+                'tweak_id' => $tweak->id,
+                'error' => $e->getMessage(),
+            ]);
 
-            return back()
-                ->with('error', 'Failed to delete tweak: ' . $e->getMessage());
+            return back()->with('error', "Failed to delete tweak: {$e->getMessage()}");
         }
     }
 
-    // Changelog Management Methods
-    public function addChangelog(Request $request, Tweak $tweak)
+    public function addChangelog(ChangeLogRequest $request, Tweak $tweak): RedirectResponse
     {
-        $request->validate([
-            'version' => 'required|string|max:50',
-            'changelog' => 'required|string',
-        ]);
-
         try {
-            Changelog::create([
-                'tweak_id' => $tweak->id,
-                'version' => $request->version,
-                'changelog' => json_encode(preg_split('/\r\n|\r|\n/', $request->changelog)),
-                'is_active' => ActiveEnums::YES,
-            ]);
-
+            $this->createChangelog($tweak, $request->version, $request->changelog);
             return back()->with('success', 'Changelog added successfully!');
         } catch (\Exception $e) {
-            return back()->with('error', 'Failed to add changelog: ' . $e->getMessage());
+            return back()->with('error', "Failed to add changelog: {$e->getMessage()}");
         }
     }
 
-    public function updateChangelog(Request $request, Tweak $tweak, Changelog $changelog)
+    public function updateChangelog(ChangeLogRequest $request, Tweak $tweak, Changelog $changelog): RedirectResponse
     {
-        $request->validate([
-            'version' => 'required|string|max:50',
-            'changelog' => 'required|string',
-        ]);
-
         try {
             $changelog->update([
                 'version' => $request->version,
-                'changelog' => json_encode(preg_split('/\r\n|\r|\n/', $request->changelog)),
+                'changelog' => $this->formatChangelog($request->changelog),
             ]);
 
             return back()->with('success', 'Changelog updated successfully!');
         } catch (\Exception $e) {
-            return back()->with('error', 'Failed to update changelog: ' . $e->getMessage());
+            return back()->with('error', "Failed to update changelog: {$e->getMessage()}");
         }
     }
 
-    public function deleteChangelog(Tweak $tweak, Changelog $changelog)
+    public function deleteChangelog(Tweak $tweak, Changelog $changelog): RedirectResponse
     {
         try {
             $changelog->delete();
             return back()->with('success', 'Changelog deleted successfully!');
         } catch (\Exception $e) {
-            return back()->with('error', 'Failed to delete changelog: ' . $e->getMessage());
+            return back()->with('error', "Failed to delete changelog: {$e->getMessage()}");
         }
     }
 
-    protected function handleExistingTweak($existingTweak, $debInfo, $filePath, $request)
-    {
-        $versionComparison = version_compare($debInfo['version'], $existingTweak->version);
+    private function handleExistingTweak(
+        Tweak $existingTweak,
+        array $debInfo,
+        string $filePath,
+        StoreTweakRequest $request
+    ): RedirectResponse {
+        $comparison = version_compare($debInfo['version'], $existingTweak->version);
 
-        if ($versionComparison > 0) {
-            $oldVersion = $existingTweak->version;
-            $this->cleanupOldTweakFiles($existingTweak);
-
-            $existingTweak->update([
-                'version' => $debInfo['version'],
-                'description' => $debInfo['description'] ?? $existingTweak->description,
-                'author' => $debInfo['author'] ?? $existingTweak->author,
-                'maintainer' => $debInfo['maintainer'] ?? $existingTweak->maintainer,
-                'section' => $debInfo['section'] ?? 'Tweaks',
-                'architecture' => $debInfo['architecture'] ?? $existingTweak->architecture,
-                'depends' => $debInfo['depends'] ?? $existingTweak->depends,
-                'homepage' => $debInfo['homepage'] ?? $existingTweak->homepage,
-                'icon_url' => $debInfo['control']['Icon'] ?? $existingTweak->icon_url,
-                'header_url' => $debInfo['control']['Header'] ?? null,
-                'sileo_depiction' => $debInfo['control']['SileoDepiction'] ?? null,
-                'installed_size' => $debInfo['control']['Installed-Size'] ?? $existingTweak->installed_size,
-                'deb_file_path' => $filePath,
-                'extracted_path' => $debInfo['extracted_path'] ?? null,
-                'icon_path' => $debInfo['icon_path'] ?? null,
-                'data_files' => json_encode($debInfo['data_files'] ?? []),
-                'control_data' => json_encode($debInfo['control'] ?? []),
-            ]);
-
-            if ($request->filled('changelog')) {
-                Changelog::create([
-                    'tweak_id' => $existingTweak->id,
-                    'version' => $debInfo['version'],
-                    'changelog' => json_encode(preg_split('/\r\n|\r|\n/', $request->changelog)),
-                    'is_active' => ActiveEnums::YES,
-                ]);
-            }
-
-            DB::commit();
-
-            return redirect()
-                ->route('dashboard.tweaks.index')
-                ->with('success', 'Tweak "' . $existingTweak->name . '" updated from version ' . $oldVersion . ' to ' . $debInfo['version'] . '!');
-
-        } elseif ($versionComparison === 0) {
-            DB::rollBack();
-            $this->cleanupFile($filePath);
-
-            return back()
-                ->withInput()
-                ->with('error', 'A tweak with package "' . $debInfo['package'] . '" already exists with the same version ' . $existingTweak->version . '.');
-        } else {
-            DB::rollBack();
-            $this->cleanupFile($filePath);
-
-            return back()
-                ->withInput()
-                ->with('error', 'A tweak with package "' . $debInfo['package'] . '" already exists with a newer version ' . $existingTweak->version . '. Uploaded version: ' . $debInfo['version']);
-        }
+        return match (true) {
+            $comparison > 0 => $this->upgradeExistingTweak($existingTweak, $debInfo, $filePath, $request),
+            $comparison === 0 => $this->handleDuplicateVersion($debInfo, $existingTweak, $filePath),
+            default => $this->handleOlderVersion($debInfo, $existingTweak, $filePath),
+        };
     }
 
-    protected function createNewTweak($debInfo, $filePath)
+    private function upgradeExistingTweak(
+        Tweak $tweak,
+        array $debInfo,
+        string $filePath,
+        StoreTweakRequest $request
+    ): RedirectResponse {
+        $oldVersion = $tweak->version;
+
+        $this->fileService->cleanupTweakFiles($tweak);
+        $tweak->update($this->prepareTweakData($debInfo, $filePath));
+        $this->createChangelogIfProvided($tweak, $request, $debInfo['version']);
+
+        return redirect()
+            ->route('dashboard.tweaks.index')
+            ->with('success', "Tweak \"{$tweak->name}\" updated from version {$oldVersion} to {$debInfo['version']}!");
+    }
+
+    private function handleDuplicateVersion(array $debInfo, Tweak $tweak, string $filePath): RedirectResponse
     {
-        return Tweak::create([
+        $this->fileService->cleanup($filePath);
+
+        return back()
+            ->withInput()
+            ->with('error', "A tweak with package \"{$debInfo['package']}\" already exists with the same version {$tweak->version}.");
+    }
+
+    private function handleOlderVersion(array $debInfo, Tweak $tweak, string $filePath): RedirectResponse
+    {
+        $this->fileService->cleanup($filePath);
+
+        return back()
+            ->withInput()
+            ->with('error', "A tweak with package \"{$debInfo['package']}\" already exists with a newer version {$tweak->version}. Uploaded version: {$debInfo['version']}");
+    }
+
+    private function createTweak(array $debInfo, string $filePath): Tweak
+    {
+        return Tweak::create($this->prepareTweakData($debInfo, $filePath));
+    }
+
+    private function prepareTweakData(array $debInfo, string $filePath): array
+    {
+        return [
             'package' => $debInfo['package'],
             'name' => $debInfo['name'],
             'version' => $debInfo['version'],
@@ -373,57 +255,96 @@ class TweaksController extends Controller
             'icon_path' => $debInfo['icon_path'] ?? null,
             'data_files' => json_encode($debInfo['data_files'] ?? []),
             'control_data' => json_encode($debInfo['control'] ?? []),
+        ];
+    }
+
+    private function updateFromDebFile(UpdateTweakRequest $request, Tweak $tweak): bool
+    {
+        $file = $request->file('file');
+        $filePath = $this->fileService->storeDebFile($file);
+        $debInfo = $this->debFileService->extractDebFile($file, basename($filePath));
+
+        $this->validatePackageMatch($debInfo['package'], $tweak->package, $filePath);
+        $versionChanged = $this->validateVersionUpdate($debInfo['version'], $tweak->version, $filePath);
+
+        if ($versionChanged) {
+            $this->fileService->cleanupTweakFiles($tweak);
+        }
+
+        $tweak->update($this->prepareTweakData($debInfo, $filePath));
+
+        return $versionChanged;
+    }
+
+    private function updateManually(UpdateTweakRequest $request, Tweak $tweak): bool
+    {
+        $updateData = $request->only(['name', 'description', 'author', 'maintainer', 'section', 'homepage']);
+        $versionChanged = false;
+
+        if ($request->filled('version') && $request->version !== $tweak->version) {
+            $this->validateVersionIsNewer($request->version, $tweak->version);
+            $updateData['version'] = $request->version;
+            $versionChanged = true;
+        }
+
+        $tweak->update($updateData);
+
+        return $versionChanged;
+    }
+
+    private function validatePackageMatch(string $newPackage, string $currentPackage, string $filePath): void
+    {
+        if ($newPackage !== $currentPackage) {
+            $this->fileService->cleanup($filePath);
+            throw new \Exception("Package ID mismatch. Expected: {$currentPackage}, Got: {$newPackage}");
+        }
+    }
+
+    private function validateVersionUpdate(string $newVersion, string $currentVersion, string $filePath): bool
+    {
+        $comparison = version_compare($newVersion, $currentVersion);
+
+        if ($comparison < 0) {
+            $this->fileService->cleanup($filePath);
+            throw new \Exception("New version ({$newVersion}) cannot be older than current version ({$currentVersion})");
+        }
+
+        return $comparison > 0;
+    }
+
+    private function validateVersionIsNewer(string $newVersion, string $currentVersion): void
+    {
+        if (version_compare($newVersion, $currentVersion) < 0) {
+            throw new \Exception('New version cannot be older than current version');
+        }
+    }
+
+    private function handleChangelogCreation(UpdateTweakRequest $request, Tweak $tweak, bool $versionChanged): void
+    {
+        if ($request->filled('changelog') && ($versionChanged || $request->boolean('force_changelog'))) {
+            $this->createChangelog($tweak, $tweak->version, $request->changelog);
+        }
+    }
+
+    private function createChangelogIfProvided(Tweak $tweak, StoreTweakRequest $request, ?string $version = null): void
+    {
+        if ($request->filled('changelog')) {
+            $this->createChangelog($tweak, $version ?? $tweak->version, $request->changelog);
+        }
+    }
+
+    private function createChangelog(Tweak $tweak, string $version, string $changelog): void
+    {
+        Changelog::create([
+            'tweak_id' => $tweak->id,
+            'version' => $version,
+            'changelog' => $this->formatChangelog($changelog),
+            'is_active' => ActiveEnums::YES,
         ]);
     }
 
-    protected function cleanupOldTweakFiles($tweak)
+    private function formatChangelog(string $changelog): string
     {
-        $filesToDelete = array_filter([
-            $tweak->deb_file_path,
-            $tweak->icon_path,
-        ]);
-
-        foreach ($filesToDelete as $file) {
-            try {
-                Storage::disk('public')->delete($file);
-            } catch (\Exception $e) {
-                Log::warning('Failed to delete old file: ' . $file, ['error' => $e->getMessage()]);
-            }
-        }
-
-        if ($tweak->extracted_path) {
-            try {
-                Storage::disk('public')->deleteDirectory($tweak->extracted_path);
-            } catch (\Exception $e) {
-                Log::warning('Failed to delete old extracted directory: ' . $tweak->extracted_path, ['error' => $e->getMessage()]);
-            }
-        }
-    }
-
-    protected function cleanupFile($filePath)
-    {
-        if ($filePath) {
-            try {
-                Storage::disk('public')->delete($filePath);
-            } catch (\Exception $e) {
-                Log::warning('Failed to cleanup file: ' . $filePath, ['error' => $e->getMessage()]);
-            }
-        }
-    }
-
-    protected function getTotalSize()
-    {
-        $totalBytes = 0;
-        $tweaks = Tweak::all();
-
-        foreach ($tweaks as $tweak) {
-            if ($tweak->deb_file_path && Storage::disk('public')->exists($tweak->deb_file_path)) {
-                $totalBytes += Storage::disk('public')->size($tweak->deb_file_path);
-            }
-        }
-
-        $units = ['B', 'KB', 'MB', 'GB'];
-        $power = $totalBytes > 0 ? floor(log($totalBytes, 1024)) : 0;
-        return number_format($totalBytes / pow(1024, $power), 2) . ' ' . $units[$power];
+        return json_encode(preg_split('/\r\n|\r|\n/', $changelog));
     }
 }
