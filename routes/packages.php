@@ -1,6 +1,6 @@
 <?php
 
-// i want make routes for files Packages & Packages.gz & Packages.bz2 & Release & Release.gpg
+// routes for Packages, Packages.gz, Packages.bz2, Release, and Release.gpg
 
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\Storage;
