@@ -45,7 +45,7 @@ class Tweak extends Model
      */
     public function getDebFileUrlAttribute(): string
     {
-        return Storage::disk('public')->url($this->deb_file_path);
+        return Storage::url($this->deb_file_path);
     }
 
     /**
@@ -54,7 +54,7 @@ class Tweak extends Model
     public function getIconUrlFullAttribute(): ?string
     {
         if ($this->icon_path) {
-            return Storage::disk('public')->url($this->icon_path);
+            return Storage::url($this->icon_path);
         }
 
         return $this->icon_url;
