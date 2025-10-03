@@ -11,6 +11,7 @@ use Illuminate\Support\Facades\Log;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Storage;
 use App\Http\Requests\Dashboard\Tweaks\StoreTweakRequest;
+use App\Http\Requests\Dashboard\Tweaks\UpdateTweakRequest;
 use Illuminate\Http\Request;
 
 class TweaksController extends Controller
@@ -24,7 +25,6 @@ class TweaksController extends Controller
 
     public function index()
     {
-        // Get statistics
         $stats = [
             'total_tweaks' => Tweak::count(),
             'total_size' => $this->getTotalSize(),
@@ -51,32 +51,22 @@ class TweaksController extends Controller
         try {
             $file = $request->file('file');
             $originalName = $file->getClientOriginalName();
-
-            // Generate unique filename
             $fileName = time() . '_' . $originalName;
-
-            // Store the original .deb file
             $filePath = $file->storeAs('tweaks/deb_files', $fileName, 'public');
-
-            // Extract and parse .deb file
             $debInfo = $this->debFileService->extractDebFile($file, $fileName);
-
-            // Check if package already exists
             $existingTweak = Tweak::where('package', $debInfo['package'])->first();
 
             if ($existingTweak) {
                 return $this->handleExistingTweak($existingTweak, $debInfo, $filePath, $request);
             }
 
-            // Create new tweak record
             $tweak = $this->createNewTweak($debInfo, $filePath);
 
-            // Create initial changelog if provided
             if ($request->filled('changelog')) {
                 Changelog::create([
                     'tweak_id' => $tweak->id,
                     'version' => $tweak->version,
-                    'changelog' => $request->changelog,
+                    'changelog' => json_encode(preg_split('/\r\n|\r|\n/', $request->changelog)),
                     'is_active' => ActiveEnums::YES,
                 ]);
             }
@@ -89,10 +79,7 @@ class TweaksController extends Controller
 
         } catch (\Exception $e) {
             DB::rollBack();
-
-            // Clean up uploaded file if exists
             $this->cleanupFile($filePath ?? null);
-
             Log::error('Tweak upload failed: ' . $e->getMessage(), [
                 'file' => $originalName ?? 'unknown',
                 'trace' => $e->getTraceAsString()
@@ -113,20 +100,131 @@ class TweaksController extends Controller
         return view('dashboard.tweaks.show', compact('tweak'));
     }
 
+    public function edit(Tweak $tweak)
+    {
+        $tweak->load(['changeLogs' => function ($query) {
+            $query->orderBy('created_at', 'desc');
+        }]);
+
+        return view('dashboard.tweaks.edit', compact('tweak'));
+    }
+
+    public function update(UpdateTweakRequest $request, Tweak $tweak)
+    {
+        DB::beginTransaction();
+
+        try {
+            $oldVersion = $tweak->version;
+            $versionChanged = false;
+
+            // Check if new .deb file is uploaded
+            if ($request->hasFile('file')) {
+                $file = $request->file('file');
+                $originalName = $file->getClientOriginalName();
+                $fileName = time() . '_' . $originalName;
+                $filePath = $file->storeAs('tweaks/deb_files', $fileName, 'public');
+                $debInfo = $this->debFileService->extractDebFile($file, $fileName);
+
+                // Verify package ID matches
+                if ($debInfo['package'] !== $tweak->package) {
+                    $this->cleanupFile($filePath);
+                    throw new \Exception('Package ID mismatch. Expected: ' . $tweak->package . ', Got: ' . $debInfo['package']);
+                }
+
+                // Check version
+                $versionComparison = version_compare($debInfo['version'], $oldVersion);
+                if ($versionComparison < 0) {
+                    $this->cleanupFile($filePath);
+                    throw new \Exception('New version (' . $debInfo['version'] . ') cannot be older than current version (' . $oldVersion . ')');
+                }
+
+                if ($versionComparison > 0) {
+                    $versionChanged = true;
+                }
+
+                // Clean up old files
+                $this->cleanupOldTweakFiles($tweak);
+
+                // Update with .deb file data
+                $tweak->update([
+                    'version' => $debInfo['version'],
+                    'description' => $debInfo['description'] ?? $tweak->description,
+                    'author' => $debInfo['author'] ?? $tweak->author,
+                    'maintainer' => $debInfo['maintainer'] ?? $tweak->maintainer,
+                    'section' => $debInfo['section'] ?? $tweak->section,
+                    'architecture' => $debInfo['architecture'] ?? $tweak->architecture,
+                    'depends' => $debInfo['depends'] ?? $tweak->depends,
+                    'homepage' => $debInfo['homepage'] ?? $tweak->homepage,
+                    'icon_url' => $debInfo['control']['Icon'] ?? $tweak->icon_url,
+                    'header_url' => $debInfo['control']['Header'] ?? $tweak->header_url,
+                    'sileo_depiction' => $debInfo['control']['SileoDepiction'] ?? $tweak->sileo_depiction,
+                    'installed_size' => $debInfo['control']['Installed-Size'] ?? $tweak->installed_size,
+                    'deb_file_path' => $filePath,
+                    'extracted_path' => $debInfo['extracted_path'] ?? null,
+                    'icon_path' => $debInfo['icon_path'] ?? null,
+                    'data_files' => json_encode($debInfo['data_files'] ?? []),
+                    'control_data' => json_encode($debInfo['control'] ?? []),
+                ]);
+
+            } else {
+                // Manual update without .deb file
+                $updateData = $request->only([
+                    'name', 'description', 'author', 'maintainer',
+                    'section', 'homepage'
+                ]);
+
+                // Check if version is being manually changed
+                if ($request->filled('version') && $request->version !== $oldVersion) {
+                    $versionComparison = version_compare($request->version, $oldVersion);
+                    if ($versionComparison < 0) {
+                        throw new \Exception('New version cannot be older than current version');
+                    }
+                    if ($versionComparison > 0) {
+                        $versionChanged = true;
+                        $updateData['version'] = $request->version;
+                    }
+                }
+
+                $tweak->update($updateData);
+            }
+
+            // Create changelog if version changed or changelog provided
+            if ($request->filled('changelog') && ($versionChanged || $request->force_changelog)) {
+                Changelog::create([
+                    'tweak_id' => $tweak->id,
+                    'version' => $tweak->version,
+                    'changelog' => json_encode(preg_split('/\r\n|\r|\n/', $request->changelog)),
+                    'is_active' => ActiveEnums::YES,
+                ]);
+            }
+
+            DB::commit();
+
+            $message = $versionChanged
+                ? 'Tweak "' . $tweak->name . '" updated from version ' . $oldVersion . ' to ' . $tweak->version . '!'
+                : 'Tweak "' . $tweak->name . '" updated successfully!';
+
+            return redirect()
+                ->route('dashboard.tweaks.show', $tweak)
+                ->with('success', $message);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            Log::error('Tweak update failed: ' . $e->getMessage());
+
+            return back()
+                ->withInput()
+                ->with('error', 'Failed to update tweak: ' . $e->getMessage());
+        }
+    }
+
     public function destroy(Tweak $tweak)
     {
         try {
             DB::beginTransaction();
-
-            // Clean up files
             $this->cleanupOldTweakFiles($tweak);
-
-            // Delete associated changelogs
             $tweak->changeLogs()->delete();
-
-            // Delete tweak
             $tweak->delete();
-
             DB::commit();
 
             return redirect()
@@ -135,7 +233,6 @@ class TweaksController extends Controller
 
         } catch (\Exception $e) {
             DB::rollBack();
-
             Log::error('Tweak deletion failed: ' . $e->getMessage());
 
             return back()
@@ -143,22 +240,65 @@ class TweaksController extends Controller
         }
     }
 
-    /**
-     * Handle existing tweak update
-     */
+    // Changelog Management Methods
+    public function addChangelog(Request $request, Tweak $tweak)
+    {
+        $request->validate([
+            'version' => 'required|string|max:50',
+            'changelog' => 'required|string',
+        ]);
+
+        try {
+            Changelog::create([
+                'tweak_id' => $tweak->id,
+                'version' => $request->version,
+                'changelog' => json_encode(preg_split('/\r\n|\r|\n/', $request->changelog)),
+                'is_active' => ActiveEnums::YES,
+            ]);
+
+            return back()->with('success', 'Changelog added successfully!');
+        } catch (\Exception $e) {
+            return back()->with('error', 'Failed to add changelog: ' . $e->getMessage());
+        }
+    }
+
+    public function updateChangelog(Request $request, Tweak $tweak, Changelog $changelog)
+    {
+        $request->validate([
+            'version' => 'required|string|max:50',
+            'changelog' => 'required|string',
+        ]);
+
+        try {
+            $changelog->update([
+                'version' => $request->version,
+                'changelog' => json_encode(preg_split('/\r\n|\r|\n/', $request->changelog)),
+            ]);
+
+            return back()->with('success', 'Changelog updated successfully!');
+        } catch (\Exception $e) {
+            return back()->with('error', 'Failed to update changelog: ' . $e->getMessage());
+        }
+    }
+
+    public function deleteChangelog(Tweak $tweak, Changelog $changelog)
+    {
+        try {
+            $changelog->delete();
+            return back()->with('success', 'Changelog deleted successfully!');
+        } catch (\Exception $e) {
+            return back()->with('error', 'Failed to delete changelog: ' . $e->getMessage());
+        }
+    }
+
     protected function handleExistingTweak($existingTweak, $debInfo, $filePath, $request)
     {
-        // Compare versions
         $versionComparison = version_compare($debInfo['version'], $existingTweak->version);
 
         if ($versionComparison > 0) {
-            // New version is higher - update the existing tweak
             $oldVersion = $existingTweak->version;
-
-            // Clean up old files
             $this->cleanupOldTweakFiles($existingTweak);
 
-            // Update tweak with new information
             $existingTweak->update([
                 'version' => $debInfo['version'],
                 'description' => $debInfo['description'] ?? $existingTweak->description,
@@ -179,12 +319,11 @@ class TweaksController extends Controller
                 'control_data' => json_encode($debInfo['control'] ?? []),
             ]);
 
-            // Create changelog for update
             if ($request->filled('changelog')) {
                 Changelog::create([
                     'tweak_id' => $existingTweak->id,
                     'version' => $debInfo['version'],
-                    'changelog' => $request->changelog,
+                    'changelog' => json_encode(preg_split('/\r\n|\r|\n/', $request->changelog)),
                     'is_active' => ActiveEnums::YES,
                 ]);
             }
@@ -196,7 +335,6 @@ class TweaksController extends Controller
                 ->with('success', 'Tweak "' . $existingTweak->name . '" updated from version ' . $oldVersion . ' to ' . $debInfo['version'] . '!');
 
         } elseif ($versionComparison === 0) {
-            // Same version
             DB::rollBack();
             $this->cleanupFile($filePath);
 
@@ -204,7 +342,6 @@ class TweaksController extends Controller
                 ->withInput()
                 ->with('error', 'A tweak with package "' . $debInfo['package'] . '" already exists with the same version ' . $existingTweak->version . '.');
         } else {
-            // Older version
             DB::rollBack();
             $this->cleanupFile($filePath);
 
@@ -214,9 +351,6 @@ class TweaksController extends Controller
         }
     }
 
-    /**
-     * Create a new tweak record
-     */
     protected function createNewTweak($debInfo, $filePath)
     {
         return Tweak::create([
@@ -242,9 +376,6 @@ class TweaksController extends Controller
         ]);
     }
 
-    /**
-     * Clean up old tweak files
-     */
     protected function cleanupOldTweakFiles($tweak)
     {
         $filesToDelete = array_filter([
@@ -260,7 +391,6 @@ class TweaksController extends Controller
             }
         }
 
-        // Clean up extracted directory if exists
         if ($tweak->extracted_path) {
             try {
                 Storage::disk('public')->deleteDirectory($tweak->extracted_path);
@@ -270,9 +400,6 @@ class TweaksController extends Controller
         }
     }
 
-    /**
-     * Clean up a single file
-     */
     protected function cleanupFile($filePath)
     {
         if ($filePath) {
@@ -284,9 +411,6 @@ class TweaksController extends Controller
         }
     }
 
-    /**
-     * Get total size of all tweaks
-     */
     protected function getTotalSize()
     {
         $totalBytes = 0;

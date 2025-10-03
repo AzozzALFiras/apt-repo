@@ -88,12 +88,9 @@ class SileoResource extends JsonResource
                             ],
                             [
                                 "class" => "DepictionMarkdownView",
-                                "markdown" => !empty($changelog->changelog) && is_array($changelog->changelog)
-                                    ? "<ul>" . implode('', array_map(
-                                        fn ($item) => "<li>" . htmlspecialchars($item) . "</li>",
-                                        $changelog->changelog
-                                    )) . "</ul>"
-                                    : "No changelog available.",
+                                "markdown" => "<ul>" . collect(json_decode($changelog->changelog, true))->map(function ($item) {
+                                    return "<li>" . e($item) . "</li>";
+                                })->implode('') . "</ul>",
                             ],
                             [
                                 "class" => "DepictionSeparatorView"

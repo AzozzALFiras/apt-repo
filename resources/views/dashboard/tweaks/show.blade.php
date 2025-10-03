@@ -18,6 +18,18 @@
     <div class="py-12">
         <div class="max-w-7xl mx-auto sm:px-6 lg:px-8 space-y-6">
 
+            @if(session('success'))
+                <div class="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded relative" role="alert">
+                    <span class="block sm:inline">{{ session('success') }}</span>
+                </div>
+            @endif
+
+            @if(session('error'))
+                <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative" role="alert">
+                    <span class="block sm:inline">{{ session('error') }}</span>
+                </div>
+            @endif
+
             <!-- Tweak Header Card -->
             <div
                 class="bg-white dark:bg-gray-800 overflow-hidden shadow-xl rounded-lg border border-gray-200 dark:border-gray-700">
@@ -93,6 +105,15 @@
                                             d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                                     </svg>
                                     Download .deb
+                                </a>
+
+                                <a href="{{ route('dashboard.tweaks.edit', $tweak) }}"
+                                    class="inline-flex items-center px-4 py-2 bg-yellow-600 hover:bg-yellow-700 text-white font-semibold rounded-lg shadow-md transition duration-150 ease-in-out">
+                                    <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                            d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                                    </svg>
+                                    Edit Tweak
                                 </a>
 
                                 @if($tweak->homepage)
@@ -284,8 +305,8 @@
                             class="relative pb-8 {{ !$loop->last ? 'border-l-2 border-gray-200 dark:border-gray-700 ml-4' : 'ml-4' }}">
                             <!-- Timeline dot -->
                             <div class="absolute left-0 -ml-[1.1rem] mt-1.5 h-8 w-8 rounded-full border-4 border-white dark:border-gray-800
-                                                        {{ $index === 0 ? 'bg-green-500' : 'bg-blue-500' }}
-                                                        flex items-center justify-center shadow-lg">
+                                                            {{ $index === 0 ? 'bg-green-500' : 'bg-blue-500' }}
+                                                            flex items-center justify-center shadow-lg">
                                 @if($index === 0)
                                     <svg class="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 20 20">
                                         <path fill-rule="evenodd"
@@ -308,7 +329,7 @@
                                     <div class="flex items-center space-x-3">
                                         <span
                                             class="inline-flex items-center px-3 py-1 rounded-full text-sm font-semibold
-                                                                     {{ $index === 0 ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' : 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200' }}">
+                                                                         {{ $index === 0 ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' : 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200' }}">
                                             Version {{ $changelog->version }}
                                         </span>
                                         <span class="text-sm text-gray-500 dark:text-gray-400">
