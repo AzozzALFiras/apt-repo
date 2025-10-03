@@ -1,9 +1,15 @@
 <?php
 
 use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\Dashboard\home\HomeController;
 use App\Http\Controllers\dashboard\tweaks\TweaksController;
 
 Route::middleware('auth')->prefix('dashboard')->group(function () {
+
+    Route::get('/', [HomeController::class, 'index'])->name('dashboard');
+    Route::get('tweaks/push', [HomeController::class, 'push'])->name('dashboard.tweaks.push');
+
+
     Route::get('tweaks', [TweaksController::class, 'index'])->name('dashboard.tweaks.index');
     Route::get('tweaks/create', [TweaksController::class, 'create'])->name('dashboard.tweaks.create');
     Route::post('tweaks', [TweaksController::class, 'store'])->name('dashboard.tweaks.store');
@@ -15,4 +21,6 @@ Route::middleware('auth')->prefix('dashboard')->group(function () {
     Route::post('tweaks/{tweak}/changelog', [TweaksController::class, 'addChangelog'])->name('dashboard.tweaks.changelog.add');
     Route::put('tweaks/{tweak}/changelog/{changelog}', [TweaksController::class, 'updateChangelog'])->name('dashboard.tweaks.changelog.update');
     Route::delete('tweaks/{tweak}/changelog/{changelog}', [TweaksController::class, 'deleteChangelog'])->name('dashboard.tweaks.changelog.delete');
+
+
 });

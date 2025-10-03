@@ -3,4 +3,4 @@
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\Api\V1\DepictionController;
 
-Route::get('description-sileo/{tweak}', [DepictionController::class, 'show']);
+Route::get('description-sileo/{tweak}', [DepictionController::class, 'show'])->name('api.v1.description.sileo');

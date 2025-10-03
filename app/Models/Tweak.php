@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Enums\ActiveEnums;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Storage;
@@ -14,6 +15,7 @@ class Tweak extends Model
         'package',
         'name',
         'version',
+        'is_active',
         'description',
         'author',
         'maintainer',
@@ -33,6 +35,7 @@ class Tweak extends Model
     ];
 
     protected $casts = [
+        'is_active' => ActiveEnums::class,
         'data_files' => 'array',
         'control_data' => 'array',
         'created_at' => 'datetime',
