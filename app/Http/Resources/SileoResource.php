@@ -22,10 +22,58 @@ class SileoResource extends JsonResource
                             "title" => $this->name . " " . $this->version,
                         ],
                         [
+                            "class" => "DepictionSubheaderView",
+                            "title" => "By " . ($this->author ?? "Unknown"),
+                        ],
+                        [
+                            "class" => "DepictionScreenshotsView",
+                            "itemSize" => "{160, 284}",
+                            "screenshots" => [
+                                [
+                                    "accessibilityText" => $this->name,
+                                    "url" => $this->icon_url_full,
+                                    "fullSizeURL" => $this->icon_url_full,
+                                ]
+                            ],
+                        ],
+                        [
                             "class" => "DepictionMarkdownView",
                             "markdown" => $this->description ?? "No description available.",
                             "useSpacing" => true,
                             "useRawFormat" => true,
+                        ],
+                        [
+                            "class" => "DepictionSeparatorView"
+                        ],
+                        [
+                            "class" => "DepictionTableTextView",
+                            "title" => "Version",
+                            "text" => $this->version,
+                        ],
+                        [
+                            "class" => "DepictionTableTextView",
+                            "title" => "Package ID",
+                            "text" => $this->package,
+                        ],
+                        [
+                            "class" => "DepictionTableTextView",
+                            "title" => "Maintainer",
+                            "text" => $this->maintainer ?? "N/A",
+                        ],
+                        [
+                            "class" => "DepictionTableTextView",
+                            "title" => "Architecture",
+                            "text" => $this->architecture ?? "N/A",
+                        ],
+                        [
+                            "class" => "DepictionTableTextView",
+                            "title" => "Installed Size",
+                            "text" => $this->formatted_size,
+                        ],
+                        [
+                            "class" => "DepictionTableButtonView",
+                            "title" => "Download .deb",
+                            "action" => $this->deb_file_url,
                         ],
                     ],
                 ],
@@ -34,11 +82,24 @@ class SileoResource extends JsonResource
                     "class" => "DepictionStackView",
                     "views" => $this->changeLogs->map(function ($changelog) {
                         return [
-                            "class" => "DepictionSubheaderView",
-                            "title" => $changelog->version,
-                            "markdown" => $changelog->description,
+                            [
+                                "class" => "DepictionSubheaderView",
+                                "title" => $changelog->version,
+                            ],
+                            [
+                                "class" => "DepictionMarkdownView",
+                                "markdown" => !empty($changelog->changelog) && is_array($changelog->changelog)
+                                    ? "<ul>" . implode('', array_map(
+                                        fn ($item) => "<li>" . htmlspecialchars($item) . "</li>",
+                                        $changelog->changelog
+                                    )) . "</ul>"
+                                    : "No changelog available.",
+                            ],
+                            [
+                                "class" => "DepictionSeparatorView"
+                            ],
                         ];
-                    })->toArray(),
+                    })->flatten(1)->toArray(), // flatten nested arrays
                 ],
                 [
                     "tabname" => "Follow Me",
@@ -56,7 +117,7 @@ class SileoResource extends JsonResource
                     "class" => "DepictionStackView",
                     "views" => [
                         [
-                            "title" => "Repo",
+                            "title" => "Repo Homepage",
                             "action" => $this->homepage ?? url("/"),
                             "class" => "DepictionTableButtonView",
                         ],
